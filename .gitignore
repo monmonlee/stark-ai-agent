@@ -39,6 +39,4 @@ temp/
 .coverage
 htmlcov/
 
-# md
-*note.md
 ```
