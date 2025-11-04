@@ -12,6 +12,7 @@ build/
 dist/
 *.egg-info/
 *test.py
+*test.ipynb
 
 # enviorment
 .env
