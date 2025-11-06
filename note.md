@@ -6,6 +6,7 @@
     * 工具：需要準備「fastapi包」和「uvicorn」，安裝在虛擬空間
         * uvicorn：把它理解為「啟動http服務」的工具
     * 項目結構：
+    ```bash
         fastapi_project/
         ├── app
         │   ├── __init__.py
@@ -20,13 +21,12 @@
         ├── tests/                   # 測試檔案(正規開發才用得到) 
         ├── requirements.txt # pip install -r requirement.txt -> -r 就是 “read requirements from file” 的縮寫，pip 會逐行讀取這個檔案並安裝。
         └── README.md
-        * 備註：這次開發的ai-agent不需要這麼正式，因為只是快速開發
+    ```
+    * 備註：這次開發的ai-agent不採用正式規格
     * app與服務：
         * 本地端：http://127.0.0.1:8000
         ```python
-
         from fastapi import FastAPI, UploadFile, File, Form
-
         app = FastAPI()
 
         # 第一個API：測試用
@@ -71,7 +71,7 @@
         * 作法：`io.BytesIO()` ＝ in-memory binary stream，就是存在記憶體裡的虛擬檔案，可以把一串的bytes包裝成「檔案樣子的物件」，這樣zipfile.ZipFile會以為是正常檔案，可以照常處理。
 
 
-**辨識檔案名稱**
+**辨識程式碼檔案**
 * 檢索邏輯：建立黑名單＆白名單辨識的def，黑名單包含不需要的測試路徑等關鍵字＆不是程式碼的檔案，白名單是大概的程式碼副檔名（參考github linguist）
     * 此 def 最後用any()+ generator comprehension來對應解壓縮的逐一檔名
     * generator comprehension 語法：
@@ -93,4 +93,69 @@
 * 解壓縮檔遍歷：
     * 使用`zf.namelist()`遍歷壓縮檔檔案
     * 每一個迭代物件都送進def read_file_or_not，返回True的就appened到清單中
-    
+
+
+**讀取程式碼內容**
+* 架構設計邏輯：
+    * 存到磁碟才需要解壓縮，如果只是在ram要讀取就不需要，只要`.read()`就行
+    * 不需要存成json檔給LLM，建立一個「Markdown + 程式碼區塊」讓LLM逐一讀取就好
+
+
+**llm-1 設計架構**
+* ai-agent 錯誤處理
+    * 目的：為避免llm輸出錯誤導致整個流程中斷，需要在不同錯誤階段採取適當處理方式。
+    * 原則：明確分類錯誤 → 局部修正 → 必要時使用raise
+    * 基本原則：
+        * 內層函數「明確拋錯」：每個處理步驟（API呼叫、解析、驗證）都使用`try...except `，只捕捉「預期錯誤」，並使用`raise...from e`保留錯誤鏈
+        * 外層「統一接錯」：在主流程（fastapi handler）統一捕捉自定義的agenterror，轉換成簡潔可回傳的訊息
+        * 能修就修，不修就使用`raise`給上層，並使用`raise...from e`這樣log才能回朔
+* openai SDK：
+    * openai.ChatCompletion.create 基礎框架：
+        ```python
+        from openai import OpenAI
+
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        result = openai_client.chat.completions.create(
+            model="model_name"
+            messages=[
+                {"role": "system" , "content": "你是一個xx專家" }
+                {"role": "user", "content": prompt } # prompt在別處定義
+            ],
+            temperature=0.3, # 溫度
+            max_tokens=1500 # token數上限
+        )
+        ```
+        * messages：取代`prompt=f"""`單一字串
+          * 提供system（人格設定）, user（任務說明）, assistant（用於多輪對話的模型回覆）不同角色的分工，通常前兩個必備，提示工程或是shot都放在user
+          * 內含多個{role, content}的對話物件
+
+    * output：`llm_output = response.choices[0].message.content.strip()`
+        * Chat Completion API 具備的固定資料結構，如下：
+            ```json
+            {
+            "id": "chatcmpl-abc123",
+            "object": "chat.completion",
+            "created": 1730900000,
+            "model": "gpt-4o-mini",
+            "choices": [
+                {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "模型的回答"
+                },
+                "finish_reason": "stop"
+                }
+            ]
+            }
+            ```
+        * content裡面的內容格式，完全取決於prompt engineering的要求（但不一定100%正確）
+        * 按照上層的結構，所有的回應都會存在於`response.choices[0].message.content`，`strip()`移除開頭結尾空格、換行符等等
+        * `result = json.loads(llm_output)`將回傳格式轉換成python物件，並加上try-except防錯機制。
+        * `assert`：假設此件事應為真，否就報錯
+            ```python
+            assert condition, "錯誤訊息（可省略）"
+            ```
+            如果條件true則繼續跑
+            反之，丟出錯誤
+
