@@ -22,11 +22,15 @@ def read_file_or_not(filename):
     code_extensions = [
         '.py', '.js', '.ts', '.jsx', '.tsx',
         '.java', '.go', '.cpp', '.c', '.rs',
-        '.rb', '.php', '.swift', '.kt'
+        '.rb', '.php', '.swift', '.kt',
+
+        # Schema & API definition files
+        '.gql', '.graphql',  # GraphQL schema
+        '.proto',            # Protocol Buffers
         ]
     
     # black list: common non-source or redundant files (reference: .gitignore templates)
-    exclude_keyworks = [
+    exclude_keywords = [
         '.test.', '.spec.',           # testing files
         'node_modules/', '__pycache__/',  # dependency folders
         '.min.js',                    # minified build files
@@ -51,7 +55,7 @@ def read_file_or_not(filename):
     if not is_code_file: 
         return False
 
-    exclude_keywords_file = any(keyword in filename for keyword in exclude_keyworks)
+    exclude_keywords_file = any(keyword in filename for keyword in exclude_keywords)
     if exclude_keywords_file:
         return False        
     
@@ -74,10 +78,10 @@ def llm1_prompt(
     file_index_code = "\n".join(file_index_code)
 
     prompt = f"""
-        You are a **software project analysis expert**. Your mission is:
-        1. **Understand the requirements**: The user has submitted a code project and described the functionalities they want to analyze.
-        2. **Filter files**: From many files in the project, identify which ones truly implement the described core features.
-        3. **Provide execution advice**: Tell the user how to run this project locally.
+        You are a software project analysis expert. Your mission is:
+        1. Understand the requirements: The user has submitted a code project and described the functionalities they want to analyze.
+        2. Filter files: From many files in the project, identify which ones truly implement the described core features.
+        3. Provide execution advice: Tell the user how to run this project locally.
         ---
         {problem_description}
         ---
@@ -159,6 +163,29 @@ def llm_stage1_navigate(
         raise RuntimeError(f"LLM-1 call failed: {e}")
 
 
+def prepare_file_for_llm2(key_files: list[str], code_contents: dict) -> dict:
+    result = []
+
+    # Match key file names with actual full paths in code_contents
+    for relative_path in key_files:
+        matched_file = None
+        for full_path in code_contents.keys():
+            if full_path.endswith(relative_path):
+                matched_file = full_path
+                break # stop searching once a match is found
+
+        if matched_file: # found a matching code file
+            result.append(
+                {"filename": relative_path,
+                "content": code_contents[matched_file]
+                })
+            print(f"sucessfully found {relative_path}")
+        else:
+            print(f"warning: cannot find {relative_path}")
+    
+    return {"key_files_content": result}
+
+
 
 # First API: for testing
 @app.get("/")
@@ -180,6 +207,14 @@ async def analyze_code(
     with zipfile.ZipFile(io.BytesIO(content)) as zf:
         file_index_all = zf.namelist()
         file_index_code = [fn for fn in file_index_all if read_file_or_not(fn)]
+        # read code files directly to minimize I/O operations
+        code_contents = {}
+        for filename in file_index_code:
+            try:
+                code_contents[filename] = zf.open(filename).read().decode('utf-8') # 對應檔名的內容解碼
+            except UnicodeDecodeError:
+                print(" Cannot decode {filename}")
+                continue 
     
     # step 3: call LLM-1 to identify key source files and generate execution suggestions
     stage1_report = llm_stage1_navigate(
@@ -188,12 +223,20 @@ async def analyze_code(
         file_index_code=file_index_code,
         target_count_hint=10,  # optional
     )
+    print(f"Stage 1 structure：{stage1_report.keys()}")
+
+    # step4: prepare decode files for LLM-2
+    key_files =  stage1_report["key_files_to_analyze"]
+    print(f"stage 1 selected files：{key_files}")
+
+    stage2_input = prepare_file_for_llm2(key_files, code_contents)
 
     return {
         "status": "received",
         "filename": code_zip.filename,
         "code_files_found": len(file_index_code),
         "report": stage1_report,
+        "stage2_input": stage2_input,
     }
 
 if __name__ == "__main__":
