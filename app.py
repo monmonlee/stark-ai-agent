@@ -69,8 +69,11 @@ def llm1_prompt(
     problem_description: str, 
     file_index_all: list, 
     file_index_code: list,
-    target_count_hint: int = 10,
 ) -> str:
+    """
+    Build the Stage-1 LLM prompt.
+    Purpose: summarize user requirement + file list + filtered code files, then ask the model to identify key source files and execution suggestions.
+    """
 
     # Backslashes are not allowed inside f-strings.
     # To make file names display neatly line-by-line, define them outside first.
@@ -119,8 +122,10 @@ def llm_stage1_navigate(
     problem_description: str, 
     file_index_all:list, 
     file_index_code: list,
-    target_count_hint: int = 10,
 ) -> dict:
+    """
+    Purpose: Calls GPT-4o-mini to analyze the entire project directory, identify key functional files, and suggest how to execute the project.
+    """
 
     # establish prompt
     prompt = llm1_prompt(problem_description, file_index_all, file_index_code)
@@ -164,6 +169,11 @@ def llm_stage1_navigate(
 
 
 def prepare_file_for_llm2(key_files: list[str], code_contents: dict) -> dict:
+    """
+    Purpose: Match filenames selected by LLM-1 with actual decoded source files.
+    Returns a dictionary containing filename–content pairs for LLM-2.
+    """
+
     result = []
 
     # Match key file names with actual full paths in code_contents
@@ -184,6 +194,153 @@ def prepare_file_for_llm2(key_files: list[str], code_contents: dict) -> dict:
             print(f"warning: cannot find {relative_path}")
     
     return {"key_files_content": result}
+
+
+def llm2_prompt(problem_description: str, stage1_report: dict, code_files_text: list[str]) -> str:
+    """
+    Purpose: Construct the Stage-2 LLM prompt: combine user requirements, Stage-1 report, and full code context to locate feature implementations.
+    """
+    
+    prompt = f"""
+    You are an expert code analyst, Your task is to locate the exact implementation of each feature described in the user's requirements.
+
+    ---
+    ## User Requirements (Problem Description)
+    {problem_description}
+    
+    ---
+    ## Project Overview (From stage 1 Analysis)
+    {stage1_report}
+
+    ---
+    ## Core Code Files
+    {code_files_text}
+    
+    ---
+    ## Your Task
+
+    1. Identify each distinct feature mentioned in the problem description
+    2. For each feature, find ALL files and functions that implement it
+    3. Locate the exact line numbers where each function is defined
+
+    Return a JSON object in this exact format:
+    ```json
+    {{
+    "feature_analysis": [
+        {{
+        "feature_description": "實現`建立頻道`功能",
+        "implementation_location": [
+            {{
+            "file": "src/modules/channel/channel.resolver.ts",
+            "function": "createChannel",
+            "lines": "13-16"
+            }},
+            {{
+            "file": "src/modules/channel/channel.service.ts",
+            "function": "create",
+            "lines": "21-24"
+            }}
+        ]
+        }}
+    ],
+    "execution_plan_suggestion": "{stage1_report['execution_plan_suggestion']}"
+    }}
+    ```
+
+    ---
+    Rules:
+    1. One Feature = One object in feature_analysis array
+    2. Each feature MUST list ALL related files where it's implemented
+    3. File pathe MUST NOT include the root directory (e.g., use `src/app.py`, not `project-main/src/app.py`)
+    4. The "lines" field MUST include the COMPLETE function definition, Start from the FIRST line of the function (including any decorators or comments directly above it), end at the LAST closing brace of the function
+    5. Function names must match the actual function/method names in the code
+    6. Return ONLY valid JSON — no explanations, no markdown, no extra text
+    7. Return 'feature_description' and 'execution_plan_suggestion' in traditional Mandarin
+    
+    ---
+
+    ## Example Feature Breakdown
+
+    If the problem description says: "建立一個多頻道論壇 API，支援建立頻道、在頻道中傳送訊息、按時間倒序列出頻道中的訊息"
+
+    Then you should identify 3 features:
+    - Feature 1: 建立頻道
+    - Feature 2: 在頻道中傳送訊息  
+    - Feature 3: 按時間倒序列出頻道中的訊息
+
+    Each feature should trace through ALL files involved in its implementation.
+
+    ## Line example:
+        - If a function starts at line 22 (with comment) and ends at line 40 (closing brace)
+        - Then "lines" should be "22-40"
+        - NOT just the first few lines like "22-24"
+    """
+    return prompt
+
+def format_code_files(stage2_input):
+    """
+    Purpose: Convert Stage-2 input into a readable text block with line numbers for feeding into the LLM.
+    """
+
+    code_files_text = ""
+    for item in stage2_input["key_files_content"]:
+        code_files_text += f"\n\n{'='*50}\n"
+        code_files_text += f"FILE: {item['filename']}\n"
+        code_files_text += f"{'='*50}\n"
+
+        # Add line numbers
+        lines = item['content'].split('\n')
+        for i, line in enumerate(lines, start=1):
+            code_files_text += f"{i:4d} | {line}\n"
+            
+    return code_files_text
+
+
+def llm_stage2_anaylze(
+    problem_description: str, 
+    stage1_report: dict, 
+    stage2_input: dict
+    ) -> dict:
+    """
+    Purpose:  Calls GPT-4o-mini to deeply analyze selected source files and generate the final structured JSON report.
+    """
+
+    # Format code files for model input
+    code_files_text = format_code_files(stage2_input)
+
+    # Build the Stage-2 prompt
+    prompt = llm2_prompt(problem_description, stage1_report, code_files_text)
+
+    try:
+
+        response = openai_client.chat.completions.create(
+            model='gpt-4o-mini',
+            messages=[ 
+                # System instruction: define the LLM's role
+                {"role": "system", "content": "You are an expert code analyst, good at understanding coding structure and position identify."},
+                # User query
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=1500
+        )
+
+        llm_output = response.choices[0].message.content.strip() 
+
+        # Remove possible markdown syntax (```json ... ```)
+        if llm_output.startswith("```json"):
+            llm_output = llm_output[7:]
+        if llm_output.endswith("```"):
+            llm_output = llm_output[:-3]
+        
+        result = json.loads(llm_output)
+
+        return result
+    
+    except json.JSONDecodeError as e:  # When LLM output is not valid JSON
+        raise ValueError(f"LLM-2 response format error: {e}\nOriginal output: {llm_output}")
+    except Exception as e:
+        raise RuntimeError(f"LLM-2 call failed: {e}")
 
 
 
@@ -221,25 +378,27 @@ async def analyze_code(
         problem_description=problem_description,
         file_index_all=file_index_all,
         file_index_code=file_index_code,
-        target_count_hint=10,  # optional
     )
     print(f"Stage 1 structure：{stage1_report.keys()}")
 
     # step4: prepare decode files for LLM-2
     key_files =  stage1_report["key_files_to_analyze"]
     print(f"stage 1 selected files：{key_files}")
-
     stage2_input = prepare_file_for_llm2(key_files, code_contents)
 
-    return {
-        "status": "received",
-        "filename": code_zip.filename,
-        "code_files_found": len(file_index_code),
-        "report": stage1_report,
-        "stage2_input": stage2_input,
-    }
+    # step5: call LLM-2 for final Json output
+    stage2_report = llm_stage2_anaylze(
+        problem_description=problem_description,
+        stage1_report=stage1_report,
+        stage2_input=stage2_input,
+    )
+
+    return stage2_report
 
 if __name__ == "__main__":
     import uvicorn
     # Run the app locally
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+
