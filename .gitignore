@@ -13,6 +13,7 @@ dist/
 *.egg-info/
 *test.py
 *test.ipynb
+note.md
 
 # enviorment
 .env
